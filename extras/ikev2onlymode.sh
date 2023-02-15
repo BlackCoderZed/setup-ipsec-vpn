@@ -2,7 +2,7 @@
 #
 # Script to enable or disable IKEv2-only mode
 #
-# Copyright (C) 2022 Lin Song <linsongui@gmail.com>
+# Copyright (C) 2022-2023 Lin Song <linsongui@gmail.com>
 #
 # This work is licensed under the Creative Commons Attribution-ShareAlike 3.0
 # Unported License: http://creativecommons.org/licenses/by-sa/3.0/
@@ -49,7 +49,7 @@ check_libreswan() {
   swan_ver=$(printf '%s' "$ipsec_ver" | sed -e 's/.*Libreswan U\?//' -e 's/\( (\|\/K\).*//')
   if ! grep -qs "hwdsl2 VPN script" /etc/sysctl.conf \
     || ! grep -qs "config setup" /etc/ipsec.conf \
-    || ! printf '%s' "$ipsec_ver" | grep -q "Libreswan"; then
+    || ! printf '%s' "$ipsec_ver" | grep -qi 'libreswan'; then
 cat 1>&2 <<'EOF'
 Error: Your must first set up the IPsec VPN server before selecting IKEv2-only mode.
        See: https://github.com/hwdsl2/setup-ipsec-vpn
@@ -59,7 +59,7 @@ EOF
   if ! check_ikev2_exists; then
 cat 1>&2 <<'EOF'
 Error: Your must first set up IKEv2 before selecting IKEv2-only mode.
-       See: https://git.io/ikev2
+       See: https://vpnsetup.net/ikev2
 EOF
     exit 1
   fi
@@ -71,7 +71,7 @@ cat 1>&2 <<EOF
 Error: Libreswan version '$swan_ver' is not supported.
        IKEv2-only mode requires Libreswan 4.2 or newer.
        To update Libreswan, run:
-       wget https://git.io/vpnupgrade -qO vpnup.sh && sudo sh vpnup.sh
+       wget https://get.vpnsetup.net/upg -O vpnup.sh && sudo sh vpnup.sh
 EOF
     exit 1
   fi

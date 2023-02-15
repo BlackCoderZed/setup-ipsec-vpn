@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2020-2022 Lin Song <linsongui@gmail.com>
+# Copyright (C) 2020-2023 Lin Song <linsongui@gmail.com>
 #
 # This work is licensed under the Creative Commons Attribution-ShareAlike 3.0
 # Unported License: http://creativecommons.org/licenses/by-sa/3.0/
@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-20.04
     if: github.repository_owner == 'hwdsl2'
     steps:
-      - uses: actions/checkout@ec3a7ce113134d7a93b817d10a8272cb61118579 # 2.4.0
+      - uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # 3.1.0
         with:
           persist-credentials: false
       - name: Check
@@ -31,8 +31,8 @@ jobs:
           sudo apt-get -yqq install wget curl
 
           wg="wget -t 3 -T 30 -nv -O"
-          gh="https://github.com/hwdsl2/setup-ipsec-vpn/raw/master"
           gi="https://git.io"
+          gh="https://github.com/hwdsl2/setup-ipsec-vpn/raw/master"
 
           $wg vpnsetup.sh          "$gi/vpnsetup"
           $wg vpnsetup_centos.sh   "$gi/vpnsetup-centos"
@@ -62,6 +62,11 @@ jobs:
           $wg vpnupgrade_ubuntu2.sh "$gh/extras/vpnupgrade_ubuntu.sh"
           $wg vpnupgrade_alpine2.sh "$gh/extras/vpnupgrade_alpine.sh"
           $wg vpnuninstall2.sh      "$gh/extras/vpnuninstall.sh"
+          $wg add_vpn_user2.sh      "$gh/extras/add_vpn_user.sh"
+          $wg del_vpn_user2.sh      "$gh/extras/del_vpn_user.sh"
+          $wg update_vpn_users2.sh  "$gh/extras/update_vpn_users.sh"
+          $wg ikev2changeaddr2.sh   "$gh/extras/ikev2changeaddr.sh"
+          $wg ikev2onlymode2.sh     "$gh/extras/ikev2onlymode.sh"
 
           diff vpnsetup.sh          ../vpnsetup.sh
           diff vpnsetup_centos.sh   ../vpnsetup_centos.sh
@@ -91,19 +96,18 @@ jobs:
           diff vpnupgrade_ubuntu2.sh ../extras/vpnupgrade_ubuntu.sh
           diff vpnupgrade_alpine2.sh ../extras/vpnupgrade_alpine.sh
           diff vpnuninstall2.sh      ../extras/vpnuninstall.sh
+          diff add_vpn_user2.sh      ../extras/add_vpn_user.sh
+          diff del_vpn_user2.sh      ../extras/del_vpn_user.sh
+          diff update_vpn_users2.sh  ../extras/update_vpn_users.sh
+          diff ikev2changeaddr2.sh   ../extras/ikev2changeaddr.sh
+          diff ikev2onlymode2.sh     ../extras/ikev2onlymode.sh
 
           url1="https://mirrors.kernel.org/ubuntu/pool/main/n/nss"
           url2="https://mirrors.kernel.org/ubuntu/pool/universe/n/nss"
-          deb1="libnss3_3.49.1-1ubuntu1.6_amd64.deb"
-          deb2="libnss3-dev_3.49.1-1ubuntu1.6_amd64.deb"
-          deb3="libnss3-tools_3.49.1-1ubuntu1.6_amd64.deb"
+          deb1="libnss3_3.49.1-1ubuntu1.8_amd64.deb"
+          deb2="libnss3-dev_3.49.1-1ubuntu1.8_amd64.deb"
+          deb3="libnss3-tools_3.49.1-1ubuntu1.8_amd64.deb"
 
           $wg 1.deb "$url1/$deb1"
           $wg 2.deb "$url1/$deb2"
           $wg 3.deb "$url2/$deb3"
-
-          bl="https://bit.ly"
-          curl -fsSI "$bl/addvpnuser"     | grep -q 'add_vpn_user.sh'
-          curl -fsSI "$bl/delvpnuser"     | grep -q 'del_vpn_user.sh'
-          curl -fsSI "$bl/updatevpnusers" | grep -q 'update_vpn_users.sh'
-          curl -fsSI "$bl/ikev2onlymode"  | grep -q 'ikev2onlymode.sh'

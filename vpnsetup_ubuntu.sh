@@ -1,14 +1,13 @@
 #!/bin/bash
 #
 # Script for automatic setup of an IPsec VPN server on Ubuntu and Debian
-# Works on any dedicated server or virtual private server (VPS)
 #
 # DO NOT RUN THIS SCRIPT ON YOUR PC OR MAC!
 #
 # The latest version of this script is available at:
 # https://github.com/hwdsl2/setup-ipsec-vpn
 #
-# Copyright (C) 2014-2022 Lin Song <linsongui@gmail.com>
+# Copyright (C) 2014-2023 Lin Song <linsongui@gmail.com>
 # Based on the work of Thomas Sarlandie (Copyright 2012)
 #
 # This work is licensed under the Creative Commons Attribution-ShareAlike 3.0
@@ -27,10 +26,6 @@
 YOUR_IPSEC_PSK=''
 YOUR_USERNAME=''
 YOUR_PASSWORD=''
-
-# Important notes:   https://git.io/vpnnotes
-# Setup VPN clients: https://git.io/vpnclients
-# IKEv2 guide:       https://git.io/ikev2
 
 # =====================================================
 
@@ -64,14 +59,26 @@ check_vz() {
   fi
 }
 
+check_lxc() {
+  # shellcheck disable=SC2154
+  if [ "$container" = "lxc" ] && [ ! -e /dev/ppp ]; then
+cat 1>&2 <<'EOF'
+Error: /dev/ppp is missing. LXC containers require configuration.
+       See: https://github.com/hwdsl2/setup-ipsec-vpn/issues/1014
+EOF
+  exit 1
+  fi
+}
+
 check_os() {
   os_type=$(lsb_release -si 2>/dev/null)
+  os_arch=$(uname -m | tr -dc 'A-Za-z0-9_-')
   [ -z "$os_type" ] && [ -f /etc/os-release ] && os_type=$(. /etc/os-release && printf '%s' "$ID")
   case $os_type in
     [Uu]buntu)
       os_type=ubuntu
       ;;
-    [Dd]ebian)
+    [Dd]ebian|[Kk]ali)
       os_type=debian
       ;;
     [Rr]aspbian)
@@ -82,12 +89,29 @@ check_os() {
       ;;
   esac
   os_ver=$(sed 's/\..*//' /etc/debian_version | tr -dc 'A-Za-z0-9')
-  if [ "$os_ver" = "8" ] || [ "$os_ver" = "jessiesid" ]; then
+  if [ "$os_ver" = 8 ] || [ "$os_ver" = "jessiesid" ]; then
     exiterr "Debian 8 or Ubuntu < 16.04 is not supported."
+  fi
+  if [ "$os_type" = "ubuntu" ] && [ "$os_ver" = "bustersid" ] \
+    && [ "$os_arch" != "x86_64" ]; then
+cat 1>&2 <<EOF
+Error: For Ubuntu 18.04, this script supports only the x86_64 architecture.
+       This system runs on $os_arch and is unsupported.
+EOF
+    exit 1
   fi
 }
 
 check_iface() {
+  if ! command -v route >/dev/null 2>&1 && ! command -v ip >/dev/null 2>&1; then
+    wait_for_apt
+    export DEBIAN_FRONTEND=noninteractive
+    (
+      set -x
+      apt-get -yqq update || apt-get -yqq update
+      apt-get -yqq install iproute2 >/dev/null
+    )
+  fi
   def_iface=$(route 2>/dev/null | grep -m 1 '^default' | grep -o '[^ ]*$')
   [ -z "$def_iface" ] && def_iface=$(ip -4 route list 0/0 2>/dev/null | grep -m 1 -Po '(?<=dev )(\S+)')
   def_state=$(cat "/sys/class/net/$def_iface/operstate" 2>/dev/null)
@@ -113,22 +137,18 @@ check_creds() {
   [ -n "$YOUR_IPSEC_PSK" ] && VPN_IPSEC_PSK="$YOUR_IPSEC_PSK"
   [ -n "$YOUR_USERNAME" ] && VPN_USER="$YOUR_USERNAME"
   [ -n "$YOUR_PASSWORD" ] && VPN_PASSWORD="$YOUR_PASSWORD"
-
   if [ -z "$VPN_IPSEC_PSK" ] && [ -z "$VPN_USER" ] && [ -z "$VPN_PASSWORD" ]; then
     bigecho "VPN credentials not set by user. Generating random PSK and password..."
     VPN_IPSEC_PSK=$(LC_CTYPE=C tr -dc 'A-HJ-NPR-Za-km-z2-9' </dev/urandom 2>/dev/null | head -c 20)
     VPN_USER=vpnuser
     VPN_PASSWORD=$(LC_CTYPE=C tr -dc 'A-HJ-NPR-Za-km-z2-9' </dev/urandom 2>/dev/null | head -c 16)
   fi
-
   if [ -z "$VPN_IPSEC_PSK" ] || [ -z "$VPN_USER" ] || [ -z "$VPN_PASSWORD" ]; then
     exiterr "All VPN credentials must be specified. Edit the script and re-enter them."
   fi
-
   if printf '%s' "$VPN_IPSEC_PSK $VPN_USER $VPN_PASSWORD" | LC_ALL=C grep -q '[^ -~]\+'; then
     exiterr "VPN credentials must not contain non-ASCII characters."
   fi
-
   case "$VPN_IPSEC_PSK $VPN_USER $VPN_PASSWORD" in
     *[\\\"\']*)
       exiterr "VPN credentials must not contain these special characters: \\ \" '"
@@ -145,7 +165,7 @@ check_dns() {
 
 check_server_dns() {
   if [ -n "$VPN_DNS_NAME" ] && ! check_dns_name "$VPN_DNS_NAME"; then
-      exiterr "Invalid DNS name. 'VPN_DNS_NAME' must be a fully qualified domain name (FQDN)."
+    exiterr "Invalid DNS name. 'VPN_DNS_NAME' must be a fully qualified domain name (FQDN)."
   fi
 }
 
@@ -153,8 +173,21 @@ check_client_name() {
   if [ -n "$VPN_CLIENT_NAME" ]; then
     name_len="$(printf '%s' "$VPN_CLIENT_NAME" | wc -m)"
     if [ "$name_len" -gt "64" ] || printf '%s' "$VPN_CLIENT_NAME" | LC_ALL=C grep -q '[^A-Za-z0-9_-]\+' \
-      || case $VPN_CLIENT_NAME in -*) true;; *) false;; esac; then
+      || case $VPN_CLIENT_NAME in -*) true ;; *) false ;; esac; then
       exiterr "Invalid client name. Use one word only, no special characters except '-' and '_'."
+    fi
+  fi
+}
+
+check_subnets() {
+  if [ -s /etc/ipsec.conf ] && grep -qs "hwdsl2 VPN script" /etc/sysctl.conf; then
+    L2TP_NET=${VPN_L2TP_NET:-'192.168.42.0/24'}
+    XAUTH_NET=${VPN_XAUTH_NET:-'192.168.43.0/24'}
+    if ! grep -q "$L2TP_NET" /etc/ipsec.conf \
+      || ! grep -q "$XAUTH_NET" /etc/ipsec.conf; then
+      echo "Error: The custom VPN subnets specified do not match initial install." >&2
+      echo "       See Advanced usage -> Customize VPN subnets for more information." >&2
+      exit 1
     fi
   fi
 }
@@ -177,8 +210,8 @@ wait_for_apt() {
   pkg_lk=/var/lib/dpkg/lock
   while fuser "$apt_lk" "$pkg_lk" >/dev/null 2>&1 \
     || lsof "$apt_lk" >/dev/null 2>&1 || lsof "$pkg_lk" >/dev/null 2>&1; do
-    [ "$count" = "0" ] && echo "## Waiting for apt to be available..."
-    [ "$count" -ge "100" ] && exiterr "Could not get apt/dpkg lock."
+    [ "$count" = 0 ] && echo "## Waiting for apt to be available..."
+    [ "$count" -ge 100 ] && exiterr "Could not get apt/dpkg lock."
     count=$((count+1))
     printf '%s' '.'
     sleep 3
@@ -204,11 +237,22 @@ install_setup_pkgs() {
   ) || exiterr2
 }
 
+get_default_ip() {
+  def_ip=$(ip -4 route get 1 | sed 's/ uid .*//' | awk '{print $NF;exit}' 2>/dev/null)
+  if check_ip "$def_ip" \
+    && ! printf '%s' "$def_ip" | grep -Eq '^(10|127|172\.(1[6-9]|2[0-9]|3[0-1])|192\.168|169\.254)\.'; then
+    public_ip="$def_ip"
+  fi
+}
+
 detect_ip() {
-  bigecho "Trying to auto discover IP of this server..."
   public_ip=${VPN_PUBLIC_IP:-''}
+  check_ip "$public_ip" || get_default_ip
+  check_ip "$public_ip" && return 0
+  bigecho "Trying to auto discover IP of this server..."
   check_ip "$public_ip" || public_ip=$(dig @resolver1.opendns.com -t A -4 myip.opendns.com +short)
-  check_ip "$public_ip" || public_ip=$(wget -t 3 -T 15 -qO- http://ipv4.icanhazip.com)
+  check_ip "$public_ip" || public_ip=$(wget -t 2 -T 10 -qO- http://ipv4.icanhazip.com)
+  check_ip "$public_ip" || public_ip=$(wget -t 2 -T 10 -qO- http://ip1.dynupdate.no-ip.com)
   check_ip "$public_ip" || exiterr "Cannot detect this server's public IP. Define it as variable 'VPN_PUBLIC_IP' and re-run this script."
 }
 
@@ -223,32 +267,106 @@ install_vpn_pkgs() {
   ) || exiterr2
 }
 
+install_nss_pkgs() {
+  if [ "$os_type" = "ubuntu" ] && [ "$os_ver" = "bustersid" ] && [ "$os_arch" = "x86_64" ] \
+    && ! dpkg -l libnss3-dev 2>/dev/null | grep -qF '3.49.1'; then
+    base_url="https://github.com/hwdsl2/vpn-extras/releases/download/v1.0.0"
+    nss_url1="https://mirrors.kernel.org/ubuntu/pool/main/n/nss"
+    nss_url2="https://mirrors.kernel.org/ubuntu/pool/universe/n/nss"
+    deb1="libnss3_3.49.1-1ubuntu1.8_amd64.deb"
+    deb2="libnss3-dev_3.49.1-1ubuntu1.8_amd64.deb"
+    deb3="libnss3-tools_3.49.1-1ubuntu1.8_amd64.deb"
+    bigecho "Installing NSS packages on Ubuntu 18.04..."
+    cd /opt/src || exit 1
+    nss_dl=0
+    /bin/rm -f "$deb1" "$deb2" "$deb3"
+    if wget -t 3 -T 30 -q "$base_url/$deb1" "$base_url/$deb2" "$base_url/$deb3"; then
+      apt-get -yqq install "./$deb1" "./$deb2" "./$deb3" >/dev/null
+    else
+      /bin/rm -f "$deb1" "$deb2" "$deb3"
+      if wget -t 3 -T 30 -q "$nss_url1/$deb1" "$nss_url1/$deb2" "$nss_url2/$deb3"; then
+        apt-get -yqq install "./$deb1" "./$deb2" "./$deb3" >/dev/null
+      else
+        nss_dl=1
+        echo "Error: Could not download NSS packages." >&2
+      fi
+    fi
+    /bin/rm -f "$deb1" "$deb2" "$deb3"
+    [ "$nss_dl" = 1 ] && exit 1
+  fi
+}
+
 install_fail2ban() {
   bigecho "Installing Fail2Ban to protect SSH..."
   (
     set -x
     apt-get -yqq install fail2ban >/dev/null
-  ) || exiterr2
+  )
+}
+
+link_scripts() {
+  cd /opt/src || exit 1
+  /bin/mv -f ikev2setup.sh ikev2.sh
+  /bin/mv -f add_vpn_user.sh addvpnuser.sh
+  /bin/mv -f del_vpn_user.sh delvpnuser.sh
+  echo "+ ikev2.sh addvpnuser.sh delvpnuser.sh"
+  for sc in ikev2.sh addvpnuser.sh delvpnuser.sh; do
+    [ -s "$sc" ] && chmod +x "$sc" && ln -s "/opt/src/$sc" /usr/bin 2>/dev/null
+  done
+}
+
+get_helper_scripts() {
+  bigecho "Downloading helper scripts..."
+  base1="https://raw.githubusercontent.com/hwdsl2/setup-ipsec-vpn/master/extras"
+  base2="https://gitlab.com/hwdsl2/setup-ipsec-vpn/-/raw/master/extras"
+  sc1=ikev2setup.sh
+  sc2=add_vpn_user.sh
+  sc3=del_vpn_user.sh
+  cd /opt/src || exit 1
+  /bin/rm -f "$sc1" "$sc2" "$sc3"
+  if wget -t 3 -T 30 -q "$base1/$sc1" "$base1/$sc2" "$base1/$sc3"; then
+    link_scripts
+  else
+    /bin/rm -f "$sc1" "$sc2" "$sc3"
+    if wget -t 3 -T 30 -q "$base2/$sc1" "$base2/$sc2" "$base2/$sc3"; then
+      link_scripts
+    else
+      echo "Warning: Could not download helper scripts." >&2
+      /bin/rm -f "$sc1" "$sc2" "$sc3"
+    fi
+  fi
 }
 
 get_swan_ver() {
-  SWAN_VER=4.6
+  SWAN_VER=4.9
   base_url="https://github.com/hwdsl2/vpn-extras/releases/download/v1.0.0"
   swan_ver_url="$base_url/v1-$os_type-$os_ver-swanver"
-  swan_ver_latest=$(wget -t 3 -T 15 -qO- "$swan_ver_url" | head -n 1)
+  swan_ver_latest=$(wget -t 2 -T 10 -qO- "$swan_ver_url" | head -n 1)
+  [ -z "$swan_ver_latest" ] && swan_ver_latest=$(curl -m 10 -fsL "$swan_ver_url" 2>/dev/null | head -n 1)
   if printf '%s' "$swan_ver_latest" | grep -Eq '^([3-9]|[1-9][0-9]{1,2})(\.([0-9]|[1-9][0-9]{1,2})){1,2}$'; then
     SWAN_VER="$swan_ver_latest"
   fi
 }
 
 check_libreswan() {
+  check_result=0
   ipsec_ver=$(/usr/local/sbin/ipsec --version 2>/dev/null)
   swan_ver_old=$(printf '%s' "$ipsec_ver" | sed -e 's/.*Libreswan U\?//' -e 's/\( (\|\/K\).*//')
-  [ "$swan_ver_old" = "$SWAN_VER" ]
+  ipsec_bin="/usr/local/sbin/ipsec"
+  if [ -n "$swan_ver_old" ] && printf '%s' "$ipsec_ver" | grep -qi 'libreswan' \
+    && [ "$(find "$ipsec_bin" -mmin -10080)" ]; then
+    check_result=1
+    return 0
+  fi
+  get_swan_ver
+  if [ -s "$ipsec_bin" ] && [ "$swan_ver_old" = "$SWAN_VER" ]; then
+    touch "$ipsec_bin"
+  fi
+  [ "$swan_ver_old" = "$SWAN_VER" ] && check_result=1
 }
 
 get_libreswan() {
-  if ! check_libreswan; then
+  if [ "$check_result" = 0 ]; then
     bigecho "Downloading Libreswan..."
     cd /opt/src || exit 1
     swan_file="libreswan-$SWAN_VER.tar.gz"
@@ -261,12 +379,12 @@ get_libreswan() {
     /bin/rm -rf "/opt/src/libreswan-$SWAN_VER"
     tar xzf "$swan_file" && /bin/rm -f "$swan_file"
   else
-    bigecho "Libreswan $SWAN_VER is already installed, skipping..."
+    bigecho "Libreswan $swan_ver_old is already installed, skipping..."
   fi
 }
 
 install_libreswan() {
-  if ! check_libreswan; then
+  if [ "$check_result" = 0 ]; then
     bigecho "Compiling and installing Libreswan, please wait..."
     cd "libreswan-$SWAN_VER" || exit 1
 cat > Makefile.inc.local <<'EOF'
@@ -276,14 +394,6 @@ USE_DH2=true
 USE_NSS_KDF=false
 FINALNSSDIR=/etc/ipsec.d
 EOF
-    if ! grep -qs 'VERSION_CODENAME=' /etc/os-release; then
-cat >> Makefile.inc.local <<'EOF'
-USE_DH31=false
-USE_NSS_AVA_COPY=true
-USE_NSS_IPSEC_PROFILE=false
-USE_GLIBC_KERN_FLIP_HEADERS=true
-EOF
-    fi
     if ! grep -qs IFLA_XFRM_LINK /usr/include/linux/if_link.h; then
       echo "USE_XFRM_INTERFACE_IFLA_HEADER=true" >> Makefile.inc.local
     fi
@@ -293,7 +403,6 @@ EOF
       set -x
       make "-j$((NPROCS+1))" -s base >/dev/null && make -s install-base >/dev/null
     )
-
     cd /opt/src || exit 1
     /bin/rm -rf "/opt/src/libreswan-$SWAN_VER"
     if ! /usr/local/sbin/ipsec --version 2>/dev/null | grep -qF "$SWAN_VER"; then
@@ -302,20 +411,8 @@ EOF
   fi
 }
 
-get_ikev2_script() {
-  bigecho "Downloading IKEv2 script..."
-  cd /opt/src || exit 1
-  ikev2_url="https://github.com/hwdsl2/setup-ipsec-vpn/raw/master/extras/ikev2setup.sh"
-  (
-    set -x
-    wget -t 3 -T 30 -q -O ikev2.sh "$ikev2_url"
-  ) || /bin/rm -f ikev2.sh
-  [ -s ikev2.sh ] && chmod +x ikev2.sh && ln -s /opt/src/ikev2.sh /usr/bin 2>/dev/null
-}
-
 create_vpn_config() {
   bigecho "Creating VPN configuration..."
-
   L2TP_NET=${VPN_L2TP_NET:-'192.168.42.0/24'}
   L2TP_LOCAL=${VPN_L2TP_LOCAL:-'192.168.42.1'}
   L2TP_POOL=${VPN_L2TP_POOL:-'192.168.42.10-192.168.42.250'}
@@ -325,7 +422,6 @@ create_vpn_config() {
   DNS_SRV2=${VPN_DNS_SRV2:-'8.8.4.4'}
   DNS_SRVS="\"$DNS_SRV1 $DNS_SRV2\""
   [ -n "$VPN_DNS_SRV1" ] && [ -z "$VPN_DNS_SRV2" ] && DNS_SRVS="$DNS_SRV1"
-
   # Create IPsec config
   conf_bk "/etc/ipsec.conf"
 cat > /etc/ipsec.conf <<EOF
@@ -345,10 +441,10 @@ conn shared
   rekey=no
   keyingtries=5
   dpddelay=30
-  dpdtimeout=120
+  dpdtimeout=300
   dpdaction=clear
   ikev2=never
-  ike=aes256-sha2,aes128-sha2,aes256-sha1,aes128-sha1,aes256-sha2;modp1024,aes128-sha1;modp1024
+  ike=aes256-sha2;modp2048,aes128-sha2;modp2048,aes256-sha1;modp2048,aes128-sha1;modp2048
   phase2alg=aes_gcm-null,aes128-sha1,aes256-sha1,aes256-sha2_512,aes128-sha2,aes256-sha2
   ikelifetime=24h
   salifetime=24h
@@ -376,19 +472,16 @@ conn xauth-psk
 
 include /etc/ipsec.d/*.conf
 EOF
-
   if uname -m | grep -qi '^arm'; then
     if ! modprobe -q sha512; then
       sed -i '/phase2alg/s/,aes256-sha2_512//' /etc/ipsec.conf
     fi
   fi
-
   # Specify IPsec PSK
   conf_bk "/etc/ipsec.secrets"
 cat > /etc/ipsec.secrets <<EOF
 %any  %any  : PSK "$VPN_IPSEC_PSK"
 EOF
-
   # Create xl2tpd config
   conf_bk "/etc/xl2tpd/xl2tpd.conf"
 cat > /etc/xl2tpd/xl2tpd.conf <<EOF
@@ -405,7 +498,6 @@ name = l2tpd
 pppoptfile = /etc/ppp/options.xl2tpd
 length bit = yes
 EOF
-
   # Set xl2tpd options
   conf_bk "/etc/ppp/options.xl2tpd"
 cat > /etc/ppp/options.xl2tpd <<EOF
@@ -422,19 +514,16 @@ lcp-echo-interval 30
 connect-delay 5000
 ms-dns $DNS_SRV1
 EOF
-
   if [ -z "$VPN_DNS_SRV1" ] || [ -n "$VPN_DNS_SRV2" ]; then
 cat >> /etc/ppp/options.xl2tpd <<EOF
 ms-dns $DNS_SRV2
 EOF
   fi
-
   # Create VPN credentials
   conf_bk "/etc/ppp/chap-secrets"
 cat > /etc/ppp/chap-secrets <<EOF
 "$VPN_USER" l2tpd "$VPN_PASSWORD" *
 EOF
-
   conf_bk "/etc/ipsec.d/passwd"
   VPN_PASSWORD_ENC=$(openssl passwd -1 "$VPN_PASSWORD")
 cat > /etc/ipsec.d/passwd <<EOF
@@ -462,11 +551,19 @@ net.ipv4.conf.default.rp_filter = 0
 net.ipv4.conf.$NET_IFACE.send_redirects = 0
 net.ipv4.conf.$NET_IFACE.rp_filter = 0
 
-net.core.wmem_max = 12582912
-net.core.rmem_max = 12582912
-net.ipv4.tcp_rmem = 10240 87380 12582912
-net.ipv4.tcp_wmem = 10240 87380 12582912
+net.core.wmem_max = 16777216
+net.core.rmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 87380 16777216
 EOF
+    if modprobe -q tcp_bbr \
+      && printf '%s\n%s' "4.20" "$(uname -r)" | sort -C -V \
+      && [ -f /proc/sys/net/ipv4/tcp_congestion_control ]; then
+cat >> /etc/sysctl.conf <<'EOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+    fi
   fi
 }
 
@@ -478,12 +575,11 @@ update_iptables() {
   if ! grep -qs "hwdsl2 VPN script" "$IPT_FILE"; then
     ipt_flag=1
   fi
-
   ipi='iptables -I INPUT'
   ipf='iptables -I FORWARD'
   ipp='iptables -t nat -I POSTROUTING'
   res='RELATED,ESTABLISHED'
-  if [ "$ipt_flag" = "1" ]; then
+  if [ "$ipt_flag" = 1 ]; then
     service fail2ban stop >/dev/null 2>&1
     iptables-save > "$IPT_FILE.old-$SYS_DT"
     $ipi 1 -p udp --dport 1701 -m policy --dir in --pol none -j DROP
@@ -504,7 +600,6 @@ update_iptables() {
     $ipp -s "$L2TP_NET" -o "$NET_IFACE" -j MASQUERADE
     echo "# Modified by hwdsl2 VPN script" > "$IPT_FILE"
     iptables-save >> "$IPT_FILE"
-
     if [ -f "$IPT_FILE2" ]; then
       conf_bk "$IPT_FILE2"
       /bin/cp -f "$IPT_FILE" "$IPT_FILE2"
@@ -535,8 +630,7 @@ enable_on_boot() {
   if [ -f "$IPT_FILE2" ] && { [ -f "$IPT_PST" ] || [ -f "$IPT_PST2" ]; }; then
     ipt_load=0
   fi
-
-  if [ "$ipt_load" = "1" ]; then
+  if [ "$ipt_load" = 1 ]; then
     mkdir -p /etc/network/if-pre-up.d
 cat > /etc/network/if-pre-up.d/iptablesload <<'EOF'
 #!/bin/sh
@@ -544,7 +638,6 @@ iptables-restore < /etc/iptables.rules
 exit 0
 EOF
     chmod +x /etc/network/if-pre-up.d/iptablesload
-
     if [ -f /usr/sbin/netplan ]; then
       mkdir -p /etc/systemd/system
 cat > /etc/systemd/system/load-iptables-rules.service <<'EOF'
@@ -568,12 +661,10 @@ EOF
       systemctl enable load-iptables-rules 2>/dev/null
     fi
   fi
-
   for svc in fail2ban ipsec xl2tpd; do
     update-rc.d "$svc" enable >/dev/null 2>&1
     systemctl enable "$svc" 2>/dev/null
   done
-
   if ! grep -qs "hwdsl2 VPN script" /etc/rc.local; then
     if [ -f /etc/rc.local ]; then
       conf_bk "/etc/rc.local"
@@ -596,10 +687,8 @@ EOF
 start_services() {
   bigecho "Starting services..."
   sysctl -e -q -p
-
   chmod +x /etc/rc.local
   chmod 600 /etc/ipsec.secrets* /etc/ppp/chap-secrets* /etc/ipsec.d/passwd*
-
   mkdir -p /run/pluto
   service fail2ban restart 2>/dev/null
   service ipsec restart 2>/dev/null
@@ -622,18 +711,16 @@ Password: $VPN_PASSWORD
 
 Write these down. You'll need them to connect!
 
-Important notes:   https://git.io/vpnnotes
-Setup VPN clients: https://git.io/vpnclients
-IKEv2 guide:       https://git.io/ikev2
+VPN client setup: https://vpnsetup.net/clients
 
 ================================================
 
 EOF
   if [ ! -e /dev/ppp ]; then
 cat <<'EOF'
-Warning: /dev/ppp is missing, and IPsec/L2TP mode may not work. Please use
-         IKEv2 (https://git.io/ikev2) or IPsec/XAuth mode to connect.
-         Debian 11/10 users, see https://git.io/vpndebian10
+Warning: /dev/ppp is missing, and IPsec/L2TP mode may not work.
+         Please use IKEv2 or IPsec/XAuth mode to connect.
+         Debian 11/10 users, see https://vpnsetup.net/debian10
 
 EOF
   fi
@@ -642,34 +729,60 @@ EOF
 set_up_ikev2() {
   status=0
   if [ -s /opt/src/ikev2.sh ] && [ ! -f /etc/ipsec.d/ikev2.conf ]; then
-    sleep 1
-    VPN_DNS_NAME="$VPN_DNS_NAME" VPN_PUBLIC_IP="$public_ip" \
-    VPN_CLIENT_NAME="$VPN_CLIENT_NAME" VPN_XAUTH_POOL="$VPN_XAUTH_POOL" \
-    VPN_DNS_SRV1="$VPN_DNS_SRV1" VPN_DNS_SRV2="$VPN_DNS_SRV2" \
-    VPN_PROTECT_CONFIG="$VPN_PROTECT_CONFIG" \
-    /bin/bash /opt/src/ikev2.sh --auto || status=1
+    skip_ikev2=0
+    case $VPN_SKIP_IKEV2 in
+      [yY][eE][sS])
+        skip_ikev2=1
+        ;;
+    esac
+    if [ "$skip_ikev2" = 0 ]; then
+      sleep 1
+      VPN_DNS_NAME="$VPN_DNS_NAME" VPN_PUBLIC_IP="$public_ip" \
+      VPN_CLIENT_NAME="$VPN_CLIENT_NAME" VPN_XAUTH_POOL="$VPN_XAUTH_POOL" \
+      VPN_DNS_SRV1="$VPN_DNS_SRV1" VPN_DNS_SRV2="$VPN_DNS_SRV2" \
+      VPN_PROTECT_CONFIG="$VPN_PROTECT_CONFIG" \
+      VPN_CLIENT_VALIDITY="$VPN_CLIENT_VALIDITY" \
+      /bin/bash /opt/src/ikev2.sh --auto || status=1
+    fi
+  elif [ -s /opt/src/ikev2.sh ]; then
+cat <<'EOF'
+================================================
+
+IKEv2 is already set up on this server.
+
+Next steps: Configure IKEv2 clients. See:
+https://vpnsetup.net/clients
+
+To manage IKEv2 clients, run: sudo ikev2.sh
+
+================================================
+
+EOF
   fi
 }
 
 vpnsetup() {
   check_root
   check_vz
+  check_lxc
   check_os
   check_iface
   check_creds
   check_dns
   check_server_dns
   check_client_name
+  check_subnets
   check_iptables
+  check_libreswan
   start_setup
   wait_for_apt
   update_apt_cache
   install_setup_pkgs
   detect_ip
   install_vpn_pkgs
+  install_nss_pkgs
   install_fail2ban
-  get_ikev2_script
-  get_swan_ver
+  get_helper_scripts
   get_libreswan
   install_libreswan
   create_vpn_config
